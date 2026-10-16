@@ -33,6 +33,8 @@ type Loop struct {
 	runDone       <-chan struct{}
 	updateTrigger chan<- Settings
 	updatedResult <-chan error
+	// Mock functions
+	newTimer func() timer
 }
 
 func NewLoop(settings settings.PortForwarding, routing Routing,
@@ -58,6 +60,11 @@ func NewLoop(settings settings.PortForwarding, routing Routing,
 		cmder:       cmder,
 		uid:         uid,
 		gid:         gid,
+		newTimer: func() timer {
+			t := time.NewTimer(time.Hour)
+			t.Stop()
+			return &timeTimer{timer: t}
+		},
 	}
 }
 
@@ -88,7 +95,7 @@ func (l *Loop) run(runCtx context.Context, runDone chan<- struct{},
 	defer close(runDone)
 
 	var serviceRunError <-chan error
-	var retryAfter <-chan time.Time
+	retryTimer := l.newTimer()
 	const retryDelay = 5 * time.Second
 	for {
 		updateReceived := false
@@ -108,10 +115,10 @@ func (l *Loop) run(runCtx context.Context, runDone chan<- struct{},
 			l.settingsMutex.Unlock()
 		case err := <-serviceRunError:
 			l.logger.Error(err.Error())
-		case <-retryAfter:
+		case <-retryTimer.C():
 		}
 		// Any pending retry is superseded by the restart below
-		retryAfter = nil
+		retryTimer.Stop()
 
 		if l.service != nil {
 			err := l.service.Stop()
@@ -130,18 +137,17 @@ func (l *Loop) run(runCtx context.Context, runDone chan<- struct{},
 
 		var err error
 		serviceRunError, err = l.service.Start(runCtx)
+		if err != nil {
+			err = fmt.Errorf("starting port forwarding service: %w - retrying in %s", err, retryDelay)
+			retryTimer.Reset(retryDelay)
+			if !updateReceived {
+				l.logger.Error(err.Error())
+			}
+		}
 		if updateReceived {
 			// Signal to the Update call that the service has started
 			// and if it failed to start.
-			if err != nil {
-				err = fmt.Errorf("starting port forwarding service: %w - retrying in %s", err, retryDelay)
-				retryAfter = time.After(retryDelay)
-			}
 			updateResult <- err
-		} else if err != nil {
-			// Log the error and schedule a retry
-			l.logger.Errorf("starting port forwarding service: %s - retrying in %s", err, retryDelay)
-			retryAfter = time.After(retryDelay)
 		}
 	}
 }
@@ -185,6 +191,17 @@ func (l *Loop) SetPortsForwarded(ports []uint16) (err error) {
 
 	return l.service.SetPortsForwarded(l.runCtx, ports)
 }
+
+// timeTimer is the time.Timer implementation of the timer interface.
+type timeTimer struct {
+	timer *time.Timer
+}
+
+func (t *timeTimer) C() <-chan time.Time { return t.timer.C }
+
+func (t *timeTimer) Reset(d time.Duration) { t.timer.Reset(d) }
+
+func (t *timeTimer) Stop() { t.timer.Stop() }
 
 func ptrTo[T any](value T) *T {
 	return &value
